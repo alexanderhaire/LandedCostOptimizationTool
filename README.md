@@ -1,0 +1,50 @@
+# PModel Cost Optimization Tool
+
+`cost_model.py` provides a command-line workflow for selecting the lowest landed-cost procurement option for Great Plains (GP) purchasing lanes. The script can be used with live GP data over ODBC or with the built-in demo data set when a database connection is not configured.
+
+## Features
+- Enumerates every vendor/mode combination discovered in GP for a requested item and quantity.
+- Applies procurement taxes exactly as described in the associated mathematics (price, fixed order, fixed freight, and variable freight components).
+- Supports both single-item optimization and batch processing from CSV or Excel sheets.
+- Falls back to an in-memory demo data set when database credentials are not supplied.
+
+## Installation
+1. Ensure Python 3.9+ is available.
+2. (Optional) Install database and spreadsheet dependencies:
+   ```bash
+   pip install pyodbc pandas
+   ```
+3. Clone this repository and change into the project directory:
+   ```bash
+   git clone <repo-url>
+   cd PModel
+   ```
+
+## Usage
+Run the script with the `one` subcommand to optimize a single item:
+```bash
+python cost_model.py one --item NPK02020 --qty 250 --dsn GP_DSN
+```
+
+For batch processing using a CSV or Excel file containing `ItemCode` and `Quantity` columns:
+```bash
+python cost_model.py sheet --in items.csv --out plans.csv
+```
+
+### Database configuration
+Provide ODBC connection details using the available flags:
+```bash
+python cost_model.py one --item NPK02020 --qty 250 \
+  --driver "{ODBC Driver 17 for SQL Server}" \
+  --server sql.host.local \
+  --database GP \
+  --username my_user \
+  --password secret
+```
+If you omit these parameters, the script uses the built-in demo data. Include `--no-fallback` to require a live database connection.
+
+## Output
+The CLI prints a human-readable breakdown along with a JSON representation of the optimal plan. Batch mode writes a results file next to the input (or to the location specified by `--out`).
+
+## License
+This project is provided as-is; supply your preferred licensing text here.
