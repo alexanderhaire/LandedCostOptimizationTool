@@ -12,10 +12,11 @@ Author: You & ChatGPT
 from __future__ import annotations
 
 import os
-import math
+import sys
 import json
+from dotenv import load_dotenv
 from dataclasses import dataclass, asdict
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from math import exp, ceil
 
 # Optional deps used only when present
@@ -220,15 +221,39 @@ class GPDataSource:
                  database: Optional[str] = None,
                  username: Optional[str] = None,
                  password: Optional[str] = None,
-                 fallback_demo: bool = True):
+                 fallback_demo: bool = True,
+                 schema: str = "dbo"):
         self.dsn = dsn
-        self.driver = driver
+        self.driver = driver  # Optional explicit driver name, e.g. "ODBC Driver 18 for SQL Server"
         self.server = server
         self.database = database
         self.username = username
         self.password = password
         self.fallback_demo = fallback_demo
+        self.schema = schema
         self._conn = None
+
+    # ---------- internal helpers ----------
+    def _pick_sql_driver(self) -> str:
+        """
+        Choose a sensible default SQL Server ODBC driver if one wasn't provided.
+        Prefers 18, then 17, then legacy "SQL Server".
+        """
+        if self.driver:
+            return self.driver
+
+        if pyodbc is None:
+            # Will be handled by connect() fallback logic
+            return "ODBC Driver 18 for SQL Server"
+
+        installed = set(d.strip() for d in pyodbc.drivers())
+        for candidate in ("ODBC Driver 18 for SQL Server",
+                          "ODBC Driver 17 for SQL Server",
+                          "SQL Server"):
+            if candidate in installed:
+                return candidate
+        # Last resort
+        return "ODBC Driver 17 for SQL Server"
 
     # ---------- connection ----------
     def connect(self):
@@ -238,25 +263,56 @@ class GPDataSource:
             if self.fallback_demo:
                 return None
             raise RuntimeError("pyodbc not installed and no fallback allowed.")
+
         try:
             if self.dsn:
-                self._conn = pyodbc.connect(f"DSN={self.dsn}")
+                # Use DSN as-is (credentials/Trusted_Connection can be part of the DSN)
+                conn_str = f"DSN={self.dsn};"
+                self._conn = pyodbc.connect(conn_str, autocommit=False, timeout=15)
             else:
-                # Typical SQL Server connection string (edit as needed)
-                driver = self.driver or "{ODBC Driver 17 for SQL Server}"
-                self._conn = pyodbc.connect(
-                    f"DRIVER={driver};SERVER={self.server};DATABASE={self.database};UID={self.username};PWD={self.password}"
-                )
-        except Exception:
+                driver_name = self._pick_sql_driver()
+                driver_fragment = f"DRIVER={{{driver_name}}}"
+
+                if self.username and self.password:
+                    # SQL authentication
+                    conn_str = (
+                        f"{driver_fragment};"
+                        f"SERVER={self.server};"
+                        f"DATABASE={self.database};"
+                        f"UID={self.username};PWD={self.password};"
+                        f"TrustServerCertificate=Yes;"
+                        f"Connection Timeout=15;"
+                    )
+                else:
+                    # Windows Integrated authentication
+                    conn_str = (
+                        f"{driver_fragment};"
+                        f"SERVER={self.server};"
+                        f"DATABASE={self.database};"
+                        f"Trusted_Connection=Yes;"
+                        f"TrustServerCertificate=Yes;"
+                        f"Connection Timeout=15;"
+                    )
+                self._conn = pyodbc.connect(conn_str, autocommit=False, timeout=15)
+
+            # Quick sanity check that the session is valid
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+            cur.close()
+
+        except Exception as e:
             if not self.fallback_demo:
-                raise
+                raise RuntimeError(f"Failed to connect to SQL Server: {e}")
+            # Fall back to demo data
             self._conn = None
+
         return self._conn
 
     # ---------- queries ----------
     def fetch_mode_params(self) -> Dict[str, ModeParams]:
         """
-        Expect a GP view like: gp_ModeParams(ModeName, FixedCost, VarCostPerTonMile, CapacityTons)
+        Expect a GP view like: dbo.gp_ModeParams(ModeName, FixedCost, VarCostPerTonMile, CapacityTons)
         """
         conn = self.connect()
         modes: Dict[str, ModeParams] = {}
@@ -269,25 +325,27 @@ class GPDataSource:
             }
             return modes
 
-        sql = """
+        sql = f"""
             SELECT ModeName, FixedCost, VarCostPerTonMile, CapacityTons
-            FROM gp_ModeParams WITH (NOLOCK)
+            FROM [{self.schema}].gp_ModeParams WITH (NOLOCK)
         """
         cur = conn.cursor()
-        for row in cur.execute(sql):
-            modes[row.ModeName] = ModeParams(
-                name=row.ModeName,
-                fixed_cost=float(row.FixedCost),
-                variable_cost_per_ton_mile=float(row.VarCostPerTonMile),
-                capacity=float(row.CapacityTons),
-            )
-        cur.close()
+        try:
+            for row in cur.execute(sql):
+                modes[row.ModeName] = ModeParams(
+                    name=str(row.ModeName).upper(),
+                    fixed_cost=float(row.FixedCost),
+                    variable_cost_per_ton_mile=float(row.VarCostPerTonMile),
+                    capacity=float(row.CapacityTons),
+                )
+        finally:
+            cur.close()
         return modes
 
     def fetch_vendor_lanes_for_item(self, item_code: str) -> List[VendorLane]:
         """
         Expect a GP view like:
-          gp_VendorLanesForItem (
+          dbo.gp_VendorLanesForItem (
              ItemCode, ItemName, VendorID, VendorName,
              PMin, PMax, Lambda, FixedOrderCost,
              WeightPerUnitTon, DistanceMile,
@@ -300,7 +358,6 @@ class GPDataSource:
         lanes: List[VendorLane] = []
 
         if conn is None:  # fallback demo
-            # Demo: two vendors for NPK02020, both allow TRUCK & RAIL; different distances/curves.
             if item_code.upper() == "NPK02020":
                 lanes.append(VendorLane(
                     item_code="NPK02020",
@@ -330,38 +387,40 @@ class GPDataSource:
                 ))
             return lanes
 
-        sql = """
+        sql = f"""
             SELECT
                 ItemCode, ItemName, VendorID, VendorName,
                 PMin, PMax, Lambda, FixedOrderCost,
                 WeightPerUnitTon, DistanceMile,
                 AllowedModesCSV,
                 TaxRate, TaxOnPrice, TaxOnFixedOrder, TaxOnVarFreight, TaxOnFixedFreight
-            FROM gp_VendorLanesForItem WITH (NOLOCK)
+            FROM [{self.schema}].gp_VendorLanesForItem WITH (NOLOCK)
             WHERE ItemCode = ?
         """
         cur = conn.cursor()
-        for row in cur.execute(sql, (item_code,)):
-            allowed = [m.strip().upper() for m in str(row.AllowedModesCSV or "").split(",") if m.strip()]
-            lanes.append(VendorLane(
-                item_code=row.ItemCode,
-                item_name=row.ItemName,
-                vendor_id=row.VendorID,
-                vendor_name=row.VendorName,
-                p_min=float(row.PMin),
-                p_max=float(row.PMax),
-                lambda_=float(row.Lambda),
-                fixed_order_cost=float(row.FixedOrderCost),
-                weight_per_unit_ton=float(row.WeightPerUnitTon),
-                distance_mile=float(row.DistanceMile),
-                allowed_modes=allowed,
-                tax_rate=float(row.TaxRate or 0.0),
-                tax_on_price=bool(row.TaxOnPrice),
-                tax_on_fixed_order=bool(row.TaxOnFixedOrder),
-                tax_on_var_freight=bool(row.TaxOnVarFreight),
-                tax_on_fixed_freight=bool(row.TaxOnFixedFreight),
-            ))
-        cur.close()
+        try:
+            for row in cur.execute(sql, (item_code,)):
+                allowed = [m.strip().upper() for m in str(row.AllowedModesCSV or "").split(",") if m.strip()]
+                lanes.append(VendorLane(
+                    item_code=str(row.ItemCode),
+                    item_name=str(row.ItemName),
+                    vendor_id=str(row.VendorID),
+                    vendor_name=str(row.VendorName),
+                    p_min=float(row.PMin),
+                    p_max=float(row.PMax),
+                    lambda_=float(row.Lambda),
+                    fixed_order_cost=float(row.FixedOrderCost),
+                    weight_per_unit_ton=float(row.WeightPerUnitTon),
+                    distance_mile=float(row.DistanceMile),
+                    allowed_modes=allowed,
+                    tax_rate=float(row.TaxRate or 0.0),
+                    tax_on_price=bool(row.TaxOnPrice),
+                    tax_on_fixed_order=bool(row.TaxOnFixedOrder),
+                    tax_on_var_freight=bool(row.TaxOnVarFreight),
+                    tax_on_fixed_freight=bool(row.TaxOnFixedFreight),
+                ))
+        finally:
+            cur.close()
         return lanes
 
 
@@ -533,11 +592,44 @@ def _print_plan(plan: PlanRow) -> None:
     print(f"  ==> Total inbound cost:      ${plan.total_inbound_cost:,.2f}\n")
 
 
+def run_interactive(ds: GPDataSource) -> None:
+    """Prompt for item + quantity and print the optimal plan."""
+    print("\n=== Inbound Purchase Optimizer (GP) ===")
+    print("Press Ctrl+C to exit.\n")
+
+    # Item code
+    while True:
+        item = input("Item code: ").strip()
+        if item:
+            break
+        print("Item code is required.")
+
+    # Quantity
+    while True:
+        qty_str = input("Quantity (buying units): ").replace(",", "").strip()
+        try:
+            qty = float(qty_str)
+            if qty <= 0:
+                raise ValueError
+            break
+        except Exception:
+            print("Please enter a positive number for quantity (e.g., 100 or 250.5).")
+
+    try:
+        plan = optimize_single_item(ds, item, qty)
+        _print_plan(plan)
+        print(json.dumps(asdict(plan), indent=2))
+    except Exception as e:
+        print(f"\n[ERROR] {e}\n")
+
+
 def main():
     import argparse
 
+    load_dotenv()  # load .env at startup
+
     parser = argparse.ArgumentParser(description="Optimize inbound purchase from GP vendor lanes.")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd")  # not required; allows interactive fallback
 
     one = sub.add_parser("one", help="Optimize a single item")
     one.add_argument("--item", required=True, help="Item code (e.g., NPK02020)")
@@ -547,26 +639,51 @@ def main():
     batch.add_argument("--in", dest="inp", required=True, help="Path to input sheet with ItemCode,Quantity")
     batch.add_argument("--out", dest="outp", help="Optional output path (csv/xlsx)")
 
-    # DB args (optional; if omitted we fall back to demo)
-    parser.add_argument("--dsn", help="ODBC DSN name (optional)")
-    parser.add_argument("--driver", help="ODBC driver (e.g., {ODBC Driver 17 for SQL Server})")
-    parser.add_argument("--server", help="SQL Server host")
-    parser.add_argument("--database", help="Database name")
-    parser.add_argument("--username", help="DB username")
+    # DB args (optional; env vars supply defaults)
+    parser.add_argument("--dsn", help="ODBC DSN name")
+    parser.add_argument("--driver", help="ODBC driver, e.g. {ODBC Driver 18 for SQL Server}")
+    parser.add_argument("--server", help="SQL Server host (e.g., DYNAMICSGP)")
+    parser.add_argument("--database", help="Database name (e.g., CDI)")
+    parser.add_argument("--username", help="DB username (omit for Windows auth)")
     parser.add_argument("--password", help="DB password")
+    parser.add_argument("--schema", help="DB schema for views (default dbo)")
     parser.add_argument("--no-fallback", action="store_true", help="Disable demo fallback")
 
-    args = parser.parse_args()
+    # If no args at all → interactive mode
+    if len(sys.argv) == 1:
+        args = parser.parse_args([])  # create a simple Namespace
+        args.cmd = None
+    else:
+        args = parser.parse_args()
+
+    # Env fallbacks (CLI overrides)
+    dsn       = args.dsn       or os.getenv("GP_DSN")
+    driver    = args.driver    or os.getenv("GP_DRIVER")
+    server    = args.server    or os.getenv("GP_SERVER")
+    database  = args.database  or os.getenv("GP_DATABASE")
+    username  = args.username  or os.getenv("GP_USERNAME")
+    password  = args.password  or os.getenv("GP_PASSWORD")
+    schema    = args.schema    or os.getenv("GP_SCHEMA", "dbo")
+
+    # no-fallback: true if CLI flag or env GP_NO_FALLBACK in {1,true,yes}
+    env_no_fallback = (os.getenv("GP_NO_FALLBACK", "").strip().lower() in {"1", "true", "yes"})
+    no_fallback = args.no_fallback or env_no_fallback
 
     ds = GPDataSource(
-        dsn=args.dsn,
-        driver=args.driver,
-        server=args.server,
-        database=args.database,
-        username=args.username,
-        password=args.password,
-        fallback_demo=not args.no_fallback
+        dsn=dsn,
+        driver=driver,
+        server=server,
+        database=database,
+        username=username,
+        password=password,
+        fallback_demo=not no_fallback,
+        schema=schema,
     )
+
+    if not args.cmd:
+        # Interactive prompt mode
+        run_interactive(ds)
+        return
 
     if args.cmd == "one":
         plan = optimize_single_item(ds, args.item, args.qty)
@@ -576,7 +693,6 @@ def main():
         plans = optimize_from_sheet(ds, args.inp, out_path=args.outp)
         for p in plans:
             _print_plan(p)
-        # Also echo a compact JSON array for downstream piping
         print(json.dumps([asdict(p) for p in plans], indent=2))
 
 
